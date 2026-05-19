@@ -150,6 +150,85 @@ func TestInstance(t *testing.T) {
 	}
 }
 
+func TestInstanceIDRequiresRegisteredSystemUUID(t *testing.T) {
+	cfg, ok := configFromEnvOrSim(true)
+	defer ok()
+
+	ctx := context.Background()
+	connMgr := cm.NewConnectionManager(&cfg.Config, nil, nil)
+	nm := newMyNodeManager(connMgr)
+	instances := newInstances(&nm.NodeManager)
+
+	vm := cfg.Map.Any("VirtualMachine").(*simulator.VirtualMachine)
+	name := strings.ToLower(vm.Name)
+	vm.Guest.HostName = name
+	vm.Guest.Net = []vimtypes.GuestNicInfo{
+		{
+			Network:   "foo-bar",
+			IpAddress: []string{"10.0.0.1"},
+		},
+	}
+
+	myUUID, err := instances.InstanceID(ctx, types.NodeName(name))
+	if err == nil {
+		t.Errorf("InstanceID expected failure but err=nil")
+	}
+	if myUUID != "" {
+		t.Errorf("InstanceID should not return UUID without SystemUUID registration, got %s", myUUID)
+	}
+	if len(nm.nodeNameMap) != 0 {
+		t.Errorf("InstanceID should not discover by name, nodeNameMap length=%d", len(nm.nodeNameMap))
+	}
+}
+
+func TestInstanceIDUsesRegisteredSystemUUIDWithMismatchedHostname(t *testing.T) {
+	cfg, ok := configFromEnvOrSim(true)
+	defer ok()
+
+	ctx := context.Background()
+	connMgr := cm.NewConnectionManager(&cfg.Config, nil, nil)
+	nm := newMyNodeManager(connMgr)
+	instances := newInstances(&nm.NodeManager)
+
+	vm := cfg.Map.Any("VirtualMachine").(*simulator.VirtualMachine)
+	guestName := strings.ToLower(vm.Name)
+	nodeName := guestName + "-k8s"
+	vm.Guest.HostName = guestName
+	vm.Guest.Net = []vimtypes.GuestNicInfo{
+		{
+			Network:   "foo-bar",
+			IpAddress: []string{"10.0.0.1"},
+		},
+	}
+	UUID := strings.ToUpper(vm.Config.Uuid)
+	k8sUUID := ConvertK8sUUIDtoNormal(UUID)
+
+	node := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: nodeName,
+		},
+		Status: v1.NodeStatus{
+			NodeInfo: v1.NodeSystemInfo{
+				SystemUUID: k8sUUID,
+			},
+		},
+	}
+
+	nm.NodeManager.RegisterNode(node)
+
+	if _, ok := nm.nodeNameMap[nodeName]; ok {
+		t.Errorf("test setup expected nodeNameMap to be keyed by guest hostname, not Kubernetes node name")
+	}
+
+	myUUID, err := instances.InstanceID(ctx, types.NodeName(nodeName))
+	if err != nil {
+		t.Errorf("InstanceID failed err=%v", err)
+	}
+	if !strings.EqualFold(myUUID, UUID) {
+		t.Errorf("InstanceID mismatch %s != %s", myUUID, UUID)
+	}
+}
+
 func TestInvalidInstance(t *testing.T) {
 	cfg, ok := configFromEnvOrSim(true)
 	defer ok()
