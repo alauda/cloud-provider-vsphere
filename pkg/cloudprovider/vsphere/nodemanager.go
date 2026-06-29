@@ -34,6 +34,7 @@ import (
 	vcfg "k8s.io/cloud-provider-vsphere/pkg/common/config"
 	cm "k8s.io/cloud-provider-vsphere/pkg/common/connectionmanager"
 	"k8s.io/cloud-provider-vsphere/pkg/common/vclib"
+	cloudproviderapi "k8s.io/cloud-provider/api"
 	v1helper "k8s.io/cloud-provider/node/helpers"
 	klog "k8s.io/klog/v2"
 
@@ -86,12 +87,16 @@ func (nm *NodeManager) RegisterNode(node *v1.Node) {
 	klog.V(4).Info("RegisterNode ENTER: ", node.Name)
 
 	uuid := ConvertK8sUUIDtoNormal(node.Status.NodeInfo.SystemUUID)
-	if err := nm.DiscoverNode(uuid, cm.FindVMByUUID); err != nil {
+	// Cache the registered node before discovery so retries can recover
+	// annotations such as provided-node-ip if this first discovery fails.
+	nm.addNode(uuid, node)
+
+	providedNodeIPs := providedNodeIPsFromNode(node)
+	if err := nm.discoverNode(uuid, cm.FindVMByUUID, providedNodeIPs); err != nil {
 		klog.Errorf("error discovering node %s: %v", node.Name, err)
 		return
 	}
 
-	nm.addNode(uuid, node)
 	klog.V(4).Info("RegisterNode LEAVE: ", node.Name)
 }
 
@@ -129,6 +134,58 @@ func (nm *NodeManager) getRegisteredUUIDByNodeName(nodeName string) (string, boo
 		}
 	}
 	return "", false
+}
+
+func (nm *NodeManager) getRegisteredNodeByUUID(uuid string) (*v1.Node, bool) {
+	nm.nodeRegInfoLock.RLock()
+	defer nm.nodeRegInfoLock.RUnlock()
+
+	node, ok := nm.nodeRegUUIDMap[uuid]
+	return node, ok
+}
+
+func (nm *NodeManager) providedNodeIPsForDiscovery(nodeID string, searchBy cm.FindVM) []net.IP {
+	switch searchBy {
+	case cm.FindVMByUUID:
+		if node, ok := nm.getRegisteredNodeByUUID(strings.ToLower(strings.TrimSpace(nodeID))); ok {
+			return providedNodeIPsFromNode(node)
+		}
+	case cm.FindVMByName:
+		if uuid, ok := nm.getRegisteredUUIDByNodeName(nodeID); ok {
+			if node, ok := nm.getRegisteredNodeByUUID(uuid); ok {
+				return providedNodeIPsFromNode(node)
+			}
+		}
+	}
+	return nil
+}
+
+func providedNodeIPsFromNode(node *v1.Node) []net.IP {
+	if node == nil || node.Annotations == nil {
+		return nil
+	}
+	return parseProvidedNodeIPs(node.Annotations[cloudproviderapi.AnnotationAlphaProvidedIPAddr])
+}
+
+func parseProvidedNodeIPs(providedNodeIP string) []net.IP {
+	if strings.TrimSpace(providedNodeIP) == "" {
+		return nil
+	}
+
+	var nodeIPs []net.IP
+	for _, rawIP := range strings.Split(providedNodeIP, ",") {
+		rawIP = strings.TrimSpace(rawIP)
+		if rawIP == "" {
+			continue
+		}
+		ip := net.ParseIP(rawIP)
+		if ip == nil {
+			klog.Warningf("Ignoring invalid %s annotation IP %q", cloudproviderapi.AnnotationAlphaProvidedIPAddr, rawIP)
+			continue
+		}
+		nodeIPs = append(nodeIPs, ip)
+	}
+	return nodeIPs
 }
 
 func (nm *NodeManager) removeNode(uuid string, node *v1.Node) {
@@ -210,6 +267,10 @@ func (c *ipAddrNetworkName) ip() net.IP {
 // DiscoverNode finds a node's VM using the specified search value and search
 // type.
 func (nm *NodeManager) DiscoverNode(nodeID string, searchBy cm.FindVM) error {
+	return nm.discoverNode(nodeID, searchBy, nm.providedNodeIPsForDiscovery(nodeID, searchBy))
+}
+
+func (nm *NodeManager) discoverNode(nodeID string, searchBy cm.FindVM, providedNodeIPs []net.IP) error {
 	ctx := context.Background()
 
 	vmDI, err := nm.shakeOutNodeIDLookup(ctx, nodeID, searchBy)
@@ -332,16 +393,31 @@ func (nm *NodeManager) DiscoverNode(nodeID string, searchBy cm.FindVM) error {
 
 	for _, ipFamily := range ipFamilies {
 		klog.V(6).Infof("ipFamily: %q nonLocalhostIPs: %v", ipFamily, sortedNonLocalhostIPs)
-		discoveredInternal, discoveredExternal := discoverIPs(
-			sortedNonLocalhostIPs,
-			ipFamily,
-			internalNetworkSubnets,
-			externalNetworkSubnets,
-			excludeInternalNetworkSubnets,
-			excludeExternalNetworkSubnets,
-			internalVMNetworkName,
-			externalVMNetworkName,
-		)
+		var discoveredInternal, discoveredExternal *ipAddrNetworkName
+		if len(providedNodeIPs) > 0 {
+			discoveredInternal, discoveredExternal = discoverIPsWithProvidedNodeIP(
+				sortedNonLocalhostIPs,
+				ipFamily,
+				internalNetworkSubnets,
+				externalNetworkSubnets,
+				excludeInternalNetworkSubnets,
+				excludeExternalNetworkSubnets,
+				internalVMNetworkName,
+				externalVMNetworkName,
+				providedNodeIPs,
+			)
+		} else {
+			discoveredInternal, discoveredExternal = discoverIPs(
+				sortedNonLocalhostIPs,
+				ipFamily,
+				internalNetworkSubnets,
+				externalNetworkSubnets,
+				excludeInternalNetworkSubnets,
+				excludeExternalNetworkSubnets,
+				internalVMNetworkName,
+				externalVMNetworkName,
+			)
+		}
 
 		klog.V(6).Infof("ipFamily: %q discovered Internal: %q discoveredExternal: %q",
 			ipFamily, discoveredInternal, discoveredExternal)
@@ -419,6 +495,18 @@ func discoverIPs(ipAddrNetworkNames []*ipAddrNetworkName, ipFamily string,
 	excludeInternalNetworkSubnets, excludeExternalNetworkSubnets []*net.IPNet,
 	internalVMNetworkName, externalVMNetworkName string,
 ) (internal *ipAddrNetworkName, external *ipAddrNetworkName) {
+	return discoverIPsWithProvidedNodeIP(ipAddrNetworkNames, ipFamily,
+		internalNetworkSubnets, externalNetworkSubnets,
+		excludeInternalNetworkSubnets, excludeExternalNetworkSubnets,
+		internalVMNetworkName, externalVMNetworkName, nil)
+}
+
+func discoverIPsWithProvidedNodeIP(ipAddrNetworkNames []*ipAddrNetworkName, ipFamily string,
+	internalNetworkSubnets, externalNetworkSubnets,
+	excludeInternalNetworkSubnets, excludeExternalNetworkSubnets []*net.IPNet,
+	internalVMNetworkName, externalVMNetworkName string,
+	providedNodeIPs []net.IP,
+) (internal *ipAddrNetworkName, external *ipAddrNetworkName) {
 	ipFamilyMatches := collectMatchesForIPFamily(ipAddrNetworkNames, ipFamily)
 
 	var discoveredInternal *ipAddrNetworkName
@@ -477,7 +565,92 @@ func discoverIPs(ipAddrNetworkNames []*ipAddrNetworkName, ipFamily string,
 			}
 		}
 	}
+
+	if providedInternal := findProvidedInternalIPCandidate(
+		filteredInternalMatches,
+		providedNodeIPs,
+		ipFamily,
+		internalNetworkSubnets,
+		externalNetworkSubnets,
+		internalVMNetworkName,
+		externalVMNetworkName,
+	); providedInternal != nil {
+		klog.V(2).Infof("Adding Internal IP by provided node IP: %s", providedInternal.ipAddr)
+		discoveredInternal = providedInternal
+	}
+
 	return discoveredInternal, discoveredExternal
+}
+
+func findProvidedInternalIPCandidate(ipFamilyMatches []*ipAddrNetworkName, providedNodeIPs []net.IP, ipFamily string,
+	internalNetworkSubnets, externalNetworkSubnets []*net.IPNet,
+	internalVMNetworkName, externalVMNetworkName string,
+) *ipAddrNetworkName {
+	if len(providedNodeIPs) == 0 {
+		return nil
+	}
+
+	hasInternalClassifiers := hasInternalNetworkClassifiers(internalNetworkSubnets, internalVMNetworkName)
+	for _, providedNodeIP := range providedNodeIPs {
+		if providedNodeIP == nil || !matchesFamily(providedNodeIP, ipFamily) {
+			continue
+		}
+
+		candidate := findCandidateByIP(ipFamilyMatches, providedNodeIP)
+		if candidate == nil {
+			klog.V(4).Infof("Provided node IP %s was not found in VM guest IPs for IP family %s", providedNodeIP.String(), ipFamily)
+			continue
+		}
+
+		matchesInternal := matchesInternalConfiguration(candidate, ipFamilyMatches, internalNetworkSubnets, internalVMNetworkName)
+		if matchesInternal {
+			return candidate
+		}
+
+		// For provided-node-ip eligibility, a positive external classifier is
+		// authoritative even if an exclusion also matches the address: the IP is
+		// still considered a valid external match and must not become InternalIP.
+		matchesExternal := matchesAnySubnet(candidate.ip(), externalNetworkSubnets) || findNetworkNameMatch([]*ipAddrNetworkName{candidate}, externalVMNetworkName) != nil
+		if matchesExternal {
+			klog.V(4).Infof("Provided node IP %s matches external network configuration and will not be used as InternalIP", candidate.ipAddr)
+			continue
+		}
+
+		if !hasInternalClassifiers {
+			return candidate
+		}
+	}
+	return nil
+}
+
+func matchesInternalConfiguration(candidate *ipAddrNetworkName, candidates []*ipAddrNetworkName, internalNetworkSubnets []*net.IPNet, internalVMNetworkName string) bool {
+	if len(internalNetworkSubnets) > 0 && findSubnetMatch(candidates, internalNetworkSubnets) != nil {
+		return matchesAnySubnet(candidate.ip(), internalNetworkSubnets)
+	}
+	return findNetworkNameMatch([]*ipAddrNetworkName{candidate}, internalVMNetworkName) != nil
+}
+
+func findCandidateByIP(ipAddrNetworkNames []*ipAddrNetworkName, ip net.IP) *ipAddrNetworkName {
+	return findFirst(ipAddrNetworkNames, func(candidate *ipAddrNetworkName) bool {
+		candidateIP := candidate.ip()
+		return candidateIP != nil && candidateIP.Equal(ip)
+	})
+}
+
+func matchesAnySubnet(ip net.IP, subnets []*net.IPNet) bool {
+	if ip == nil {
+		return false
+	}
+	for _, subnet := range subnets {
+		if subnet.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasInternalNetworkClassifiers(internalNetworkSubnets []*net.IPNet, internalVMNetworkName string) bool {
+	return len(internalNetworkSubnets) > 0 || internalVMNetworkName != ""
 }
 
 // collectNonVNICDevices filters out NICs that are virtual NIC devices. The IPs of

@@ -29,6 +29,7 @@ import (
 	"github.com/vmware/govmomi/simulator"
 	vimtypes "github.com/vmware/govmomi/vim25/types"
 	ccfg "k8s.io/cloud-provider-vsphere/pkg/cloudprovider/vsphere/config"
+	cloudproviderapi "k8s.io/cloud-provider/api"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -93,6 +94,125 @@ func TestRegUnregNode(t *testing.T) {
 	if len(nm.nodeRegUUIDMap) != 0 {
 		t.Errorf("Failed: nodeRegUUIDMap should be a length of 0")
 	}
+}
+
+func TestRegisterNodeUsesProvidedNodeIP(t *testing.T) {
+	cfg, fin := configFromEnvOrSim(true)
+	defer fin()
+
+	connMgr := cm.NewConnectionManager(&cfg.Config, nil, nil)
+	defer connMgr.Logout()
+
+	nm := newNodeManager(nil, connMgr)
+
+	vm := cfg.Map.Any("VirtualMachine").(*simulator.VirtualMachine)
+	vm.Guest.HostName = vm.Name
+	vm.Guest.Net = []vimtypes.GuestNicInfo{
+		{
+			Network:   "foo-bar",
+			IpAddress: []string{"10.0.0.1", "10.0.0.2"},
+		},
+	}
+
+	UUID := vm.Config.Uuid
+	k8sUUID := ConvertK8sUUIDtoNormal(UUID)
+	node := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: vm.Name,
+			Annotations: map[string]string{
+				cloudproviderapi.AnnotationAlphaProvidedIPAddr: "10.0.0.2",
+			},
+		},
+		Status: v1.NodeStatus{
+			NodeInfo: v1.NodeSystemInfo{SystemUUID: k8sUUID},
+		},
+	}
+
+	nm.RegisterNode(node)
+
+	nodeInfo, ok := nm.nodeUUIDMap[strings.ToLower(strings.TrimSpace(UUID))]
+	if !ok {
+		t.Fatalf("expected node info for UUID %s", UUID)
+	}
+	for _, addr := range nodeInfo.NodeAddresses {
+		if addr.Type == v1.NodeInternalIP && addr.Address == "10.0.0.2" {
+			return
+		}
+	}
+	t.Fatalf("expected provided node IP to be selected as InternalIP, got %v", nodeInfo.NodeAddresses)
+}
+
+func TestRegisterNodeCachesProvidedNodeIPForRetryAfterDiscoveryFailure(t *testing.T) {
+	cfg, fin := configFromEnvOrSim(true)
+	defer fin()
+
+	connMgr := cm.NewConnectionManager(&cfg.Config, nil, nil)
+	defer connMgr.Logout()
+
+	nm := newNodeManager(nil, connMgr)
+
+	vm := cfg.Map.Any("VirtualMachine").(*simulator.VirtualMachine)
+	vm.Guest.HostName = vm.Name
+	vm.Guest.Net = nil
+
+	UUID := vm.Config.Uuid
+	k8sUUID := ConvertK8sUUIDtoNormal(UUID)
+	node := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: vm.Name,
+			Annotations: map[string]string{
+				cloudproviderapi.AnnotationAlphaProvidedIPAddr: "10.0.0.2",
+			},
+		},
+		Status: v1.NodeStatus{
+			NodeInfo: v1.NodeSystemInfo{SystemUUID: k8sUUID},
+		},
+	}
+
+	nm.RegisterNode(node)
+
+	normalizedUUID := strings.ToLower(strings.TrimSpace(UUID))
+	if registeredNode, ok := nm.nodeRegUUIDMap[normalizedUUID]; !ok || registeredNode != node {
+		t.Fatalf("expected failed registration to cache node for UUID %s", normalizedUUID)
+	}
+	if len(nm.nodeNameMap) != 0 {
+		t.Fatalf("expected nodeNameMap to remain empty after failed discovery, got %d entries", len(nm.nodeNameMap))
+	}
+	if len(nm.nodeUUIDMap) != 0 {
+		t.Fatalf("expected nodeUUIDMap to remain empty after failed discovery, got %d entries", len(nm.nodeUUIDMap))
+	}
+
+	vm.Guest.Net = []vimtypes.GuestNicInfo{
+		{
+			Network:   "foo-bar",
+			IpAddress: []string{"10.0.0.1", "10.0.0.2"},
+		},
+	}
+
+	if err := nm.DiscoverNode(UUID, cm.FindVMByUUID); err != nil {
+		t.Fatalf("expected retry discovery to succeed: %v", err)
+	}
+
+	nodeInfo, ok := nm.nodeUUIDMap[normalizedUUID]
+	if !ok {
+		t.Fatalf("expected node info for UUID %s after retry", normalizedUUID)
+	}
+	for _, addr := range nodeInfo.NodeAddresses {
+		if addr.Type == v1.NodeInternalIP && addr.Address == "10.0.0.2" {
+			nm.UnregisterNode(node)
+			if len(nm.nodeRegUUIDMap) != 0 {
+				t.Fatalf("expected nodeRegUUIDMap to be empty after unregister, got %d entries", len(nm.nodeRegUUIDMap))
+			}
+			if len(nm.nodeNameMap) != 0 {
+				t.Fatalf("expected nodeNameMap to be empty after unregister, got %d entries", len(nm.nodeNameMap))
+			}
+			if len(nm.nodeUUIDMap) != 0 {
+				t.Fatalf("expected nodeUUIDMap to be empty after unregister, got %d entries", len(nm.nodeUUIDMap))
+			}
+			return
+		}
+	}
+	t.Fatalf("expected retry discovery to use provided node IP as InternalIP, got %v", nodeInfo.NodeAddresses)
 }
 
 func TestDiscoverNodeByName(t *testing.T) {
@@ -235,6 +355,7 @@ func TestDiscoverNodeIPs(t *testing.T) {
 		cpiConfig        *ccfg.CPIConfig
 		networks         []vimtypes.GuestNicInfo
 		guestinfo        string
+		providedNodeIPs  []string
 	}
 	testcases := []struct {
 		testName               string
@@ -268,6 +389,71 @@ func TestDiscoverNodeIPs(t *testing.T) {
 			},
 			expectedIPs: []v1.NodeAddress{
 				{Type: "InternalIP", Address: "10.10.1.22"},
+				{Type: "ExternalIP", Address: "172.15.108.10"},
+			},
+		},
+		{
+			testName: "ByProvidedNodeIP_InternalSubnet",
+			setup: testSetup{
+				ipFamilyPriority: []string{"ipv4"},
+				cpiConfig: &ccfg.CPIConfig{
+					Nodes: ccfg.Nodes{InternalNetworkSubnetCIDR: "10.10.0.0/16"},
+				},
+				providedNodeIPs: []string{"10.10.1.23"},
+				networks: []vimtypes.GuestNicInfo{
+					{Network: "net_123abc", IpAddress: []string{"10.10.1.22", "10.10.1.23"}},
+				},
+			},
+			expectedIPs: []v1.NodeAddress{{Type: "InternalIP", Address: "10.10.1.23"}},
+		},
+		{
+			testName: "ByProvidedNodeIP_ExternalSubnetDoesNotBecomeInternal",
+			setup: testSetup{
+				ipFamilyPriority: []string{"ipv4"},
+				cpiConfig: &ccfg.CPIConfig{
+					Nodes: ccfg.Nodes{
+						InternalNetworkSubnetCIDR: "10.10.0.0/16",
+						ExternalNetworkSubnetCIDR: "172.15.0.0/16",
+					},
+				},
+				providedNodeIPs: []string{"172.15.108.10"},
+				networks: []vimtypes.GuestNicInfo{
+					{Network: "net_123abc", IpAddress: []string{"10.10.1.22", "172.15.108.10"}},
+				},
+			},
+			expectedIPs: []v1.NodeAddress{
+				{Type: "InternalIP", Address: "10.10.1.22"},
+				{Type: "ExternalIP", Address: "172.15.108.10"},
+			},
+		},
+		{
+			testName: "ByProvidedNodeIP_ExternalOnlySubnetDoesNotBecomeInternal",
+			setup: testSetup{
+				ipFamilyPriority: []string{"ipv4"},
+				cpiConfig: &ccfg.CPIConfig{
+					Nodes: ccfg.Nodes{ExternalNetworkSubnetCIDR: "172.15.0.0/16"},
+				},
+				providedNodeIPs: []string{"172.15.108.10"},
+				networks: []vimtypes.GuestNicInfo{
+					{Network: "net_123abc", IpAddress: []string{"10.10.1.22", "172.15.108.10"}},
+				},
+			},
+			expectedIPs: []v1.NodeAddress{{Type: "ExternalIP", Address: "172.15.108.10"}},
+		},
+		{
+			testName: "ByProvidedNodeIP_ExternalOnlySubnetUsesNonExternalProvidedIPAsInternal",
+			setup: testSetup{
+				ipFamilyPriority: []string{"ipv4"},
+				cpiConfig: &ccfg.CPIConfig{
+					Nodes: ccfg.Nodes{ExternalNetworkSubnetCIDR: "172.15.0.0/16"},
+				},
+				providedNodeIPs: []string{"10.10.1.23"},
+				networks: []vimtypes.GuestNicInfo{
+					{Network: "net_123abc", IpAddress: []string{"10.10.1.22", "10.10.1.23", "172.15.108.10"}},
+				},
+			},
+			expectedIPs: []v1.NodeAddress{
+				{Type: "InternalIP", Address: "10.10.1.23"},
 				{Type: "ExternalIP", Address: "172.15.108.10"},
 			},
 		},
@@ -306,6 +492,59 @@ func TestDiscoverNodeIPs(t *testing.T) {
 			},
 		},
 		{
+			testName: "ByProvidedNodeIP_InternalNetworkName",
+			setup: testSetup{
+				ipFamilyPriority: []string{"ipv4"},
+				cpiConfig: &ccfg.CPIConfig{
+					Nodes: ccfg.Nodes{InternalVMNetworkName: "internal_net"},
+				},
+				providedNodeIPs: []string{"10.10.1.23"},
+				networks: []vimtypes.GuestNicInfo{
+					{Network: "internal_net", IpAddress: []string{"10.10.1.22", "10.10.1.23"}},
+				},
+			},
+			expectedIPs: []v1.NodeAddress{{Type: "InternalIP", Address: "10.10.1.23"}},
+		},
+		{
+			testName: "ByProvidedNodeIP_ExternalNetworkNameDoesNotBecomeInternal",
+			setup: testSetup{
+				ipFamilyPriority: []string{"ipv4"},
+				cpiConfig: &ccfg.CPIConfig{
+					Nodes: ccfg.Nodes{
+						InternalVMNetworkName: "internal_net",
+						ExternalVMNetworkName: "external_net",
+					},
+				},
+				providedNodeIPs: []string{"172.15.108.10"},
+				networks: []vimtypes.GuestNicInfo{
+					{Network: "internal_net", IpAddress: []string{"10.10.1.22"}},
+					{Network: "external_net", IpAddress: []string{"172.15.108.10"}},
+				},
+			},
+			expectedIPs: []v1.NodeAddress{
+				{Type: "InternalIP", Address: "10.10.1.22"},
+				{Type: "ExternalIP", Address: "172.15.108.10"},
+			},
+		},
+		{
+			testName: "ByProvidedNodeIP_ExternalOnlyNetworkNameUsesNonExternalProvidedIPAsInternal",
+			setup: testSetup{
+				ipFamilyPriority: []string{"ipv4"},
+				cpiConfig: &ccfg.CPIConfig{
+					Nodes: ccfg.Nodes{ExternalVMNetworkName: "external_net"},
+				},
+				providedNodeIPs: []string{"10.10.1.23"},
+				networks: []vimtypes.GuestNicInfo{
+					{Network: "node_net", IpAddress: []string{"10.10.1.22", "10.10.1.23"}},
+					{Network: "external_net", IpAddress: []string{"172.15.108.10"}},
+				},
+			},
+			expectedIPs: []v1.NodeAddress{
+				{Type: "InternalIP", Address: "10.10.1.23"},
+				{Type: "ExternalIP", Address: "172.15.108.10"},
+			},
+		},
+		{
 			testName: "ByDefaultSelection",
 			setup: testSetup{
 				ipFamilyPriority: []string{"ipv4"},
@@ -326,6 +565,62 @@ func TestDiscoverNodeIPs(t *testing.T) {
 							"172.15.108.11",
 						},
 					},
+				},
+			},
+			expectedIPs: []v1.NodeAddress{
+				{Type: "InternalIP", Address: "10.10.1.22"},
+				{Type: "ExternalIP", Address: "10.10.1.22"},
+			},
+		},
+		{
+			testName: "ByProvidedNodeIP_DefaultSelection",
+			setup: testSetup{
+				ipFamilyPriority: []string{"ipv4"},
+				cpiConfig:        nil,
+				providedNodeIPs:  []string{"10.10.1.23"},
+				networks: []vimtypes.GuestNicInfo{
+					{
+						Network: "net_123abc",
+						IpAddress: []string{
+							"10.10.1.22",
+							"10.10.1.23",
+						},
+					},
+				},
+			},
+			expectedIPs: []v1.NodeAddress{
+				{Type: "InternalIP", Address: "10.10.1.23"},
+				{Type: "ExternalIP", Address: "10.10.1.22"},
+			},
+		},
+		{
+			testName: "ByProvidedNodeIP_NotInGuestNetKeepsDefaultSelection",
+			setup: testSetup{
+				ipFamilyPriority: []string{"ipv4"},
+				cpiConfig:        nil,
+				providedNodeIPs:  []string{"10.10.1.99"},
+				networks: []vimtypes.GuestNicInfo{
+					{
+						Network:   "net_123abc",
+						IpAddress: []string{"10.10.1.22", "10.10.1.23"},
+					},
+				},
+			},
+			expectedIPs: []v1.NodeAddress{
+				{Type: "InternalIP", Address: "10.10.1.22"},
+				{Type: "ExternalIP", Address: "10.10.1.22"},
+			},
+		},
+		{
+			testName: "ByProvidedNodeIP_ExcludedInternalKeepsDefaultSelection",
+			setup: testSetup{
+				ipFamilyPriority: []string{"ipv4"},
+				cpiConfig: &ccfg.CPIConfig{
+					Nodes: ccfg.Nodes{ExcludeInternalNetworkSubnetCIDR: "10.10.1.23/32"},
+				},
+				providedNodeIPs: []string{"10.10.1.23"},
+				networks: []vimtypes.GuestNicInfo{
+					{Network: "net_123abc", IpAddress: []string{"10.10.1.22", "10.10.1.23"}},
 				},
 			},
 			expectedIPs: []v1.NodeAddress{
@@ -1857,7 +2152,15 @@ func TestDiscoverNodeIPs(t *testing.T) {
 			}
 
 			// subject
-			err = nm.DiscoverNode(name, cm.FindVMByName)
+			var providedNodeIPs []net.IP
+			for _, providedNodeIP := range testcase.setup.providedNodeIPs {
+				providedNodeIPs = append(providedNodeIPs, net.ParseIP(providedNodeIP))
+			}
+			if len(providedNodeIPs) > 0 {
+				err = nm.discoverNode(name, cm.FindVMByName, providedNodeIPs)
+			} else {
+				err = nm.DiscoverNode(name, cm.FindVMByName)
+			}
 			if testcase.expectedErrorSubstring != "" {
 				if err == nil {
 					t.Errorf("failed: expected DiscoverNode to return error containing: %q but no error occurred", testcase.expectedErrorSubstring)
