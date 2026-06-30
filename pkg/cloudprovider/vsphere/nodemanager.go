@@ -119,6 +119,18 @@ func (nm *NodeManager) addNode(uuid string, node *v1.Node) {
 	nm.nodeRegInfoLock.Unlock()
 }
 
+func (nm *NodeManager) getRegisteredUUIDByNodeName(nodeName string) (string, bool) {
+	nm.nodeRegInfoLock.RLock()
+	defer nm.nodeRegInfoLock.RUnlock()
+
+	for uuid, node := range nm.nodeRegUUIDMap {
+		if node.GetName() == nodeName {
+			return uuid, true
+		}
+	}
+	return "", false
+}
+
 func (nm *NodeManager) removeNode(uuid string, node *v1.Node) {
 	nm.nodeRegInfoLock.Lock()
 	klog.V(4).Info("removeNode NodeName: ", node.GetName(), ", UID: ", uuid)

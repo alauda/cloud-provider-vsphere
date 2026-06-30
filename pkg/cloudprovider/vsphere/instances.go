@@ -97,24 +97,29 @@ func (i *instances) ExternalID(ctx context.Context, nodeName types.NodeName) (st
 func (i *instances) InstanceID(ctx context.Context, nodeName types.NodeName) (string, error) {
 	klog.V(4).Info("instances.InstanceID() called with ", nodeName)
 
-	// Check if node has been discovered already
-	if node, ok := i.nodeManager.nodeNameMap[string(nodeName)]; ok {
-		klog.V(2).Info("instances.InstanceID() CACHED with ", string(nodeName))
+	uuid, ok := i.nodeManager.getRegisteredUUIDByNodeName(string(nodeName))
+	if !ok {
+		klog.V(4).Infof("instances.InstanceID() node %s is not registered by SystemUUID", string(nodeName))
+		return "", ErrNodeNotFound
+	}
+
+	if node, ok := i.nodeManager.nodeUUIDMap[uuid]; ok {
+		klog.V(2).Info("instances.InstanceID() CACHED with ", uuid)
 		return node.UUID, nil
 	}
 
-	err := i.nodeManager.DiscoverNode(string(nodeName), cm.FindVMByName)
-	if err == nil {
-		if i.nodeManager.nodeNameMap[string(nodeName)] == nil {
-			klog.Errorf("DiscoverNode succeeded, but CACHE missed for node=%s. If this is a Linux VM, hostnames are case sensitive. Make sure they match.", string(nodeName))
-			return "", ErrNodeNotFound
-		}
-		klog.V(2).Infof("instances.InstanceID() FOUND with %s", string(nodeName))
-		return i.nodeManager.nodeNameMap[string(nodeName)].UUID, nil
+	if err := i.nodeManager.DiscoverNode(uuid, cm.FindVMByUUID); err != nil {
+		klog.V(4).Infof("instances.InstanceID() failed with err: %v", err)
+		return "", err
 	}
 
-	klog.V(4).Infof("instances.InstanceID() failed with err: %v", err)
-	return "", err
+	node := i.nodeManager.nodeUUIDMap[uuid]
+	if node == nil {
+		klog.Errorf("DiscoverNode succeeded, but UUID cache missed for node=%s uuid=%s", string(nodeName), uuid)
+		return "", ErrNodeNotFound
+	}
+	klog.V(2).Infof("instances.InstanceID() FOUND with %s", uuid)
+	return node.UUID, nil
 }
 
 // InstanceType returns the type of the instance identified by name.
